@@ -17,39 +17,38 @@ app.post('/webhook', async (req, res) => {
   const events = req.body.events;
   if (!events || !events.length) return res.status(200).end();
 
-  await Promise.all(events.map(async (event) => {
-    if (event.type !== 'message' || event.message.type !== 'text') return;
+await Promise.all(events.map(async (event) => {
+  if (event.type !== 'message' || event.message.type !== 'text') return;
 
-    const userInput = event.message.text;
-    let gptReply = '抱歉，我無法理解。';
+  const userInput = event.message.text;
+  let gptReply = '抱歉，我無法理解。';
 
-    try {
-      const response = await axios.post(
-        'https://api.openai.com/v1/chat/completions',
-        {
-          model: 'gpt-4',
-          messages: [{ role: 'user', content: userInput }],
-        },
-        {
-          headers: {
-            'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`,
-            'Content-Type': 'application/json'
-          }
+  try {
+    const response = await axios.post(
+      'https://api.openai.com/v1/chat/completions',
+      {
+        model: 'gpt-3.5-turbo',
+        messages: [{ role: 'user', content: userInput }],
+      },
+      {
+        headers: {
+          'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`,
+          'Content-Type': 'application/json'
         }
-      );
-      gptReply = response.data.choices[0].message.content;
-    } catch (err) {
-      console.error('OpenAI Error:', err.message);
-    }
+      }
+    );
+    gptReply = response.data.choices[0].message.content;
+  } catch (err) {
+    console.error('OpenAI Error:', err.message);
+    gptReply = '⚠️ GPT 回應失敗，請稍後再試。'; // ❗️補一個預設錯誤訊息
+  }
 
-    return client.replyMessage(event.replyToken, {
-      type: 'text',
-      text: gptReply
-    });
-  }));
+  return client.replyMessage(event.replyToken, {
+    type: 'text',
+    text: gptReply
+  });
+}));
 
-  res.status(200).end();
-});
 
 const port = process.env.PORT || 3000;
 app.listen(port, () => {
