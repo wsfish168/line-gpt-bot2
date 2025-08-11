@@ -1,122 +1,109 @@
-require('dotenv').config();
 const express = require('express');
-const { Client, middleware } = require('@line/bot-sdk');
-const axios = require('axios');
+const line = require('@line/bot-sdk');
 const fs = require('fs');
-const path = require('path');
+const axios = require('axios');
+require('dotenv').config();
 
+const app = express();
+
+// LINE Bot 設定
 const config = {
   channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN,
-  channelSecret: process.env.LINE_CHANNEL_SECRET,
+  channelSecret: process.env.LINE_CHANNEL_SECRET
 };
 
-const client = new Client(config);
-const app = express();
-app.use(middleware(config));
-app.use(express.json());
-
-let lastRequestTime = 0;
-const COOLDOWN_MS = 2000; // 每次請求間至少 2 秒
-
-// 載入 FAQ JSON 檔案
-const faqPath = path.join(__dirname, 'faq.json');
-let faqList = [];
-
+// 載入 FAQ
+let faqData = [];
 try {
-  faqList = JSON.parse(fs.readFileSync(faqPath, 'utf8'));
-} catch (e) {
-  console.error('讀取 FAQ 失敗：', e.message);
+  faqData = JSON.parse(fs.readFileSync('faq.json', 'utf8'));
+} catch (err) {
+  console.error('❌ 無法讀取 faq.json：', err);
 }
 
-app.post('/webhook', async (req, res) => {
-  const events = req.body.events;
-  if (!events || !events.length) return res.status(200).end();
+// 建立 LINE Client
+const client = new line.Client(config);
 
-  await Promise.all(events.map(async (event) => {
-    // ✅ 歡迎訊息處理
-    if (event.type === 'follow') {
-      try {
-        const profile = await client.getProfile(event.source.userId);
-        const name = profile.displayName || '朋友';
-        return client.replyMessage(event.replyToken, {
-          type: 'text',
-          text: `歡迎加入，${name}！我是文山智能客服，有問題隨時問我 🤖`
-        });
-      } catch (err) {
-        console.error('取得用戶名稱失敗：', err.message);
-        return client.replyMessage(event.replyToken, {
-          type: 'text',
-          text: '感謝加入！我是文山智能客服，有問題隨時問我 🤖'
-        });
-      }
-    }
-
-    // ✅ 處理文字訊息
-    if (event.type !== 'message' || event.message.type !== 'text') return;
-
-    const userInput = event.message.text;
-    let gptReply = '抱歉，發生錯誤，請稍後再試。';
-
-    // ✅ FAQ 模糊關鍵字比對
-    const matchedFAQ = faqList.find(faq =>
-      faq.keywords.some(keyword => userInput.includes(keyword))
-    );
-
-    if (matchedFAQ) {
-      gptReply = matchedFAQ.reply;
-    } else {
-      // ✅ 加入冷卻機制防止 OpenAI API 過度使用
-      const now = Date.now();
-      if (now - lastRequestTime < COOLDOWN_MS) {
-        gptReply = '請稍候再試 🙏（冷卻中）';
-      } else {
-        lastRequestTime = now;
-
-        try {
-          const response = await axios.post(
-            'https://api.openai.com/v1/chat/completions',
-            {
-              model: 'gpt-3.5-turbo',
-              messages: [
-                {
-                  role: 'system',
-                  content: '你是位親切的線上客服，具有專業的稅務諮詢能力，也擅長辦理公司行號相關的設立、變更登記，條列式回答簡短明確，可以用一點emoji',
-                },
-                {
-                  role: 'user',
-                  content: userInput
-                }
-              ],
-            },
-            {
-              headers: {
-                Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-                'Content-Type': 'application/json',
-              },
-            }
-          );
-          gptReply = response.data.choices[0].message.content || '（無內容）';
-        } catch (err) {
-          console.error('OpenAI Error:', err.message);
-          if (err.response?.status === 429) {
-            gptReply = '請求過於頻繁，請稍後再試（429）';
-          } else if (err.response?.status === 404) {
-            gptReply = '模型錯誤（404），請檢查 model 名稱';
-          }
-        }
-      }
-    }
-
-    return client.replyMessage(event.replyToken, {
-      type: 'text',
-      text: gptReply
+// Webhook 路由
+app.post('/webhook', line.middleware(config), async (req, res) => {
+  Promise.all(req.body.events.map(handleEvent))
+    .then(result => res.json(result))
+    .catch(err => {
+      console.error('❌ Webhook 錯誤：', err);
+      res.status(500).end();
     });
-  }));
-
-  res.status(200).end();
 });
 
-const port = process.env.PORT || 3000;
-app.listen(port, () => {
-  console.log(`🚀 Server is running on port ${port}`);
+// 處理事件
+async function handleEvent(event) {
+  // 只處理訊息事件
+  if (event.type !== 'message' || event.message.type !== 'text') {
+    return null;
+  }
+
+  const userMessage = event.message.text.trim();
+
+  // 新好友加入（歡迎訊息）
+  if (event.source.type === 'user' && userMessage === '') {
+    const profile = await client.getProfile(event.source.userId);
+    return client.replyMessage(event.replyToken, {
+      type: 'text',
+      text: `嗨 ${profile.displayName} 👋 歡迎加入我們！有關稅務、公司登記的問題都可以問我喔 📄💡`
+    });
+  }
+
+  // FAQ 模糊關鍵字比對
+  const faqItem = faqData.find(item => userMessage.includes(item.question));
+  if (faqItem) {
+    return client.replyMessage(event.replyToken, {
+      type: 'text',
+      text: faqItem.answer
+    });
+  }
+
+  // 呼叫 OpenAI ChatGPT
+  try {
+    const openaiRes = await axios.post(
+      'https://api.openai.com/v1/chat/completions',
+      {
+        model: 'gpt-3.5-turbo',
+        messages: [
+          {
+            role: 'system',
+            content: '你是位親切的線上客服，具有專業的稅務諮詢能力，也擅長辦理公司行號相關的設立、變更登記，回答簡短明確，可以用一點emoji。'
+          },
+          { role: 'user', content: userMessage }
+        ],
+        temperature: 0.7
+      },
+      {
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${process.env.OPENAI_API_KEY}`
+        }
+      }
+    );
+
+    const replyText = openaiRes.data.choices[0].message.content.trim();
+    return client.replyMessage(event.replyToken, {
+      type: 'text',
+      text: replyText
+    });
+
+  } catch (error) {
+    console.error('❌ OpenAI API 錯誤：', error.response?.data || error.message);
+    return client.replyMessage(event.replyToken, {
+      type: 'text',
+      text: '抱歉，目前服務繁忙，請稍後再試 ⏳'
+    });
+  }
+}
+
+// 防 Render 免費版休眠的 GET /
+app.get('/', (req, res) => {
+  res.send('✅ LINE ChatGPT bot is running');
+});
+
+// 啟動伺服器
+app.listen(process.env.PORT || 3000, () => {
+  console.log('🚀 Server is running');
 });
