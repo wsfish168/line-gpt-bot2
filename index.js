@@ -1,112 +1,118 @@
-import express from "express";
-import { middleware, Client } from "@line/bot-sdk";
-import dotenv from "dotenv";
-import fs from "fs";
-import OpenAI from "openai";
+import express from 'express';
+import dotenv from 'dotenv';
+import fs from 'fs';
+import { Configuration, OpenAIApi } from 'openai';
+import pkg from '@line/bot-sdk';
 
 dotenv.config();
 
+// LINE Bot 設定
 const config = {
   channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN,
-  channelSecret: process.env.LINE_CHANNEL_SECRET,
+  channelSecret: process.env.LINE_CHANNEL_SECRET
 };
 
-const client = new Client(config);
+const client = new pkg.Client(config);
 const app = express();
-const port = process.env.PORT || 3000;
 
 // 讀取 FAQ
-let faq = [];
+let faqData = [];
 try {
-  faq = JSON.parse(fs.readFileSync("./faq.json", "utf8"));
-} catch (error) {
-  console.error("❌ 讀取 FAQ 失敗：", error);
+  const faqRaw = fs.readFileSync('./faq.json', 'utf8');
+  faqData = JSON.parse(faqRaw);
+  console.log('✅ FAQ 載入完成，共', faqData.length, '條');
+} catch (err) {
+  console.error('❌ FAQ 載入失敗：', err);
 }
 
-// OpenAI 初始化
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-});
-
-// Webhook 路由
-app.post(
-  "/webhook",
-  (req, res, next) => {
-    if (!req.headers["x-line-signature"]) {
-      console.warn("⚠️ Webhook 請求沒有簽章");
-      return res.status(200).send("No signature, ignored");
-    }
-    next();
-  },
-  middleware(config),
-  async (req, res) => {
-    try {
-      const events = req.body.events;
-      await Promise.all(events.map(handleEvent));
-      res.status(200).end();
-    } catch (error) {
-      console.error("❌ 處理 Webhook 錯誤：", error);
-      res.status(200).end();
-    }
-  }
+// OpenAI 設定
+const openai = new OpenAIApi(
+  new Configuration({
+    apiKey: process.env.OPENAI_API_KEY
+  })
 );
 
-// 處理事件
+// Middleware
+app.post('/webhook', pkg.middleware(config), async (req, res) => {
+  try {
+    const events = req.body.events;
+    await Promise.all(events.map(handleEvent));
+    res.status(200).end();
+  } catch (err) {
+    console.error('❌ Webhook 處理錯誤：', err);
+    res.status(500).end();
+  }
+});
+
+// 處理 LINE 訊息
 async function handleEvent(event) {
-  // 歡迎訊息（依使用者名稱客製化）
-  if (event.type === "follow") {
-    try {
-      const profile = await client.getProfile(event.source.userId);
-      const welcomeMsg = `嗨 ${profile.displayName} 😊 歡迎加入！我是文山智能客服，請問有什麼問題呢？`;
-      return client.replyMessage(event.replyToken, { type: "text", text: welcomeMsg });
-    } catch (error) {
-      console.error("❌ 無法取得使用者名稱：", error);
-      return client.replyMessage(event.replyToken, { type: "text", text: "您好~歡迎加入！我是文山智能客服~請問有什麼問題呢？" });
+  if (event.type === 'follow') {
+    // 歡迎詞（客製化）
+    const profile = await client.getProfile(event.source.userId);
+    const welcomeMsg = `嗨 ${profile.displayName}，歡迎加入！我是您的智能客服 🤖\n可以問我稅務、公司設立、變更登記等問題喔 📄`;
+    return client.replyMessage(event.replyToken, { type: 'text', text: welcomeMsg });
+  }
+
+  if (event.type !== 'message' || event.message.type !== 'text') return;
+
+  const userMsg = event.message.text.trim();
+
+  // FAQ 第一層：完全匹配
+  for (const faq of faqData) {
+    if (faq.keywords.some(keyword => userMsg.includes(keyword))) {
+      console.log(`📌 回覆路徑：完全匹配 → ${faq.keywords}`);
+      return client.replyMessage(event.replyToken, { type: 'text', text: faq.reply });
     }
   }
 
-  // 只處理文字訊息
-  if (event.type !== "message" || event.message.type !== "text") return;
-  const userMessage = event.message.text.trim();
-
-  // FAQ 關鍵字匹配
-  const matchedFAQ = faq.find(item =>
-    item.keywords.some(keyword => userMessage.includes(keyword))
-  );
-
-  if (matchedFAQ) {
-    return client.replyMessage(event.replyToken, { type: "text", text: matchedFAQ.reply });
+  // FAQ 第二層：模糊匹配（計分）
+  let bestMatch = null;
+  let highestScore = 0;
+  for (const faq of faqData) {
+    let score = 0;
+    faq.keywords.forEach(keyword => {
+      if (userMsg.includes(keyword)) score++;
+    });
+    if (score > highestScore) {
+      highestScore = score;
+      bestMatch = faq;
+    }
   }
 
-  // OpenAI 回覆（gpt-3.5-turbo）
+  if (bestMatch && highestScore > 0) {
+    console.log(`📌 回覆路徑：模糊匹配（分數 ${highestScore}）→ ${bestMatch.keywords}`);
+    return client.replyMessage(event.replyToken, { type: 'text', text: bestMatch.reply });
+  }
+
+  // 第三層：GPT 回覆
+  console.log(`📌 回覆路徑：GPT 回覆（未匹配 FAQ）`);
   try {
-    const completion = await openai.chat.completions.create({
-      model: "gpt-3.5-turbo",
+    const completion = await openai.createChatCompletion({
+      model: 'gpt-3.5-turbo',
       messages: [
         {
-          role: "system",
-          content: "你是位親切的線上客服，具有專業的稅務諮詢能力，也擅長辦理公司行號相關的設立、變更登記，回答簡短明確，可以用一點emoji",
+          role: 'system',
+          content:
+            '你是位親切的線上客服，具有專業的稅務諮詢能力，也擅長辦理公司行號相關的設立、變更登記，回答簡短明確，可以用一點emoji。'
         },
-        { role: "user", content: userMessage },
-      ],
+        { role: 'user', content: userMsg }
+      ]
     });
 
-    const aiReply = completion.choices[0].message.content.trim();
-    return client.replyMessage(event.replyToken, {
-      type: "text",
-      text: aiReply || "抱歉，目前無法提供回覆。",
-    });
-  } catch (error) {
-    console.error("❌ OpenAI 回覆失敗：", error);
-    return client.replyMessage(event.replyToken, { type: "text", text: "抱歉，目前系統忙碌，請稍後再試。" });
+    const gptReply = completion.data.choices[0].message.content.trim();
+    return client.replyMessage(event.replyToken, { type: 'text', text: gptReply });
+  } catch (err) {
+    console.error('❌ GPT 回覆錯誤：', err);
+    return client.replyMessage(event.replyToken, { type: 'text', text: '抱歉，我暫時無法回答您的問題 🙏' });
   }
 }
 
-// 健康檢查（給 UptimeRobot 用）
-app.get("/", (req, res) => {
-  res.status(200).send("OK");
+// Render 保活用
+app.get('/', (req, res) => {
+  res.send('Bot is running');
 });
 
+const port = process.env.PORT || 3000;
 app.listen(port, () => {
-  console.log(`✅ Server running on port ${port}`);
+  console.log(`✅ Server is running on port ${port}`);
 });
